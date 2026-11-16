@@ -1,9 +1,6 @@
 name: Crypto Scanner
 
 on:
-  schedule:
-    # right after each 4h candle close (UTC): 00:02, 04:02, 08:02, 12:02, 16:02, 20:02
-    - cron: '2 0,4,8,12,16,20 * * *'
   workflow_dispatch:
 
 permissions:
@@ -36,9 +33,3 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python scanner.py
-
-      - name: Keep schedule alive
-        if: ${{ github.event_name == 'schedule' }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh workflow enable "Crypto Scanner" --repo "$GITHUB_REPOSITORY" || true
