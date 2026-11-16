@@ -34,13 +34,23 @@ BTC_DUMP_PCT = 4.0
 BTC_MODE = "warn"             # "warn" = still alert with warning, "block" = pause alerts
 BTC_DUMP_MIN_SCORE = 70
 
+# ---- PUMP / BIG BREAKOUT rules ----
+PUMP_ENABLED = True
+PUMP_BODY_PCT = 8.0           # last closed 4h candle body >= this %
+PUMP_2C_PCT = 12.0            # OR last 2 candles combined >= this %
+PUMP_LOOKBACK = 18            # close must break highest high of last N 4h candles (18 = 3 days)
+PUMP_VOL4H_X = 2.0            # 4h volume >= X times avg of last 20 candles
+PUMP_D1_VOL_X = 2.0           # 1D volume >= X times avg of previous 20 days
+PUMP_RESEND_HOURS = 6
+PUMP_MAX_ALERTS = 10          # max pump alerts per run
+
 WATCHLIST_MAX = 40
 WATCH_MAX_DAYS = 21
 RESEND_HOURS = 24
 
 SKIP = {"TSLA","NVDA","AAPL","MSFT","AMZN","GOOGL","META","COIN","MSTR","HOOD",
         "CRCL","SPY","QQQ","XAU","XAG","GOLD","SILVER","OIL","USOIL"}
-STEP = {"Week1": 604800, "Hour4": 14400}
+STEP = {"Week1": 604800, "Hour4": 14400, "Day1": 86400}
 
 
 # ---------------- helpers ----------------
@@ -239,6 +249,54 @@ def btc_regime():
         return dict(above=True, chg2=0.0)
 
 
+# ---------------- PUMP / BIG BREAKOUT ----------------
+def pump_check(sym):
+    """Big green 4h candle + breakout + 4h volume spike + 1D volume vs average."""
+    try:
+        h4 = klines(sym, "Hour4", 150)
+        if h4 is None or len(h4) < 40:
+            return None
+        for n in (6, 12, 20):
+            h4[f"e{n}"] = ema(h4.c, n)
+        hc = closed(h4, STEP["Hour4"])
+        if len(hc) < PUMP_LOOKBACK + 5:
+            return None
+        last = hc.iloc[-1]
+        body = float((last.c / last.o - 1) * 100)
+        two = float((last.c / hc.o.iloc[-2] - 1) * 100)
+        if last.c <= last.o:
+            return None
+        if not (body >= PUMP_BODY_PCT or two >= PUMP_2C_PCT):
+            return None
+        prev_high = float(hc.h.iloc[-1 - PUMP_LOOKBACK:-1].max())
+        if last.c <= prev_high:
+            return None
+        vol_avg = float(hc.v.iloc[-21:-1].mean())
+        vr4 = float(last.v / vol_avg) if vol_avg > 0 else 0.0
+        if vr4 < PUMP_VOL4H_X:
+            return None
+        # daily volume check (only fetched if 4h passed)
+        d1 = klines(sym, "Day1", 60)
+        if d1 is None or len(d1) < 25:
+            return None
+        d_avg = float(d1.v.iloc[-22:-2].mean())
+        if d_avg <= 0:
+            return None
+        d_now = float(max(d1.v.iloc[-1], d1.v.iloc[-2]))
+        dvr = d_now / d_avg
+        if dvr < PUMP_D1_VOL_X:
+            return None
+        price = float(last.c)
+        info = dict(symbol=sym, price=price, body=round(body, 1), two=round(two, 1),
+                    vr4=round(vr4, 1), dvr=round(dvr, 1), d1_avg=d_avg,
+                    prev_high=prev_high,
+                    sl=float(min(last.o, hc.l.iloc[-3:].min())) * 0.99,
+                    mega=bool(body >= 15 and dvr >= 4))
+        return dict(info=info, hc=hc, d1=d1)
+    except Exception:
+        return None
+
+
 # ---------------- chart + telegram ----------------
 def candles(ax, df):
     for i, row in df.iterrows():
@@ -292,6 +350,44 @@ def make_chart(z, h4, info, total, tgt):
     buf.seek(0)
     return buf
 
+def make_pump_chart(p):
+    info, hc, d1 = p["info"], p["hc"], p["d1"]
+    fig, (a, b) = plt.subplots(2, 1, figsize=(12, 12),
+                               gridspec_kw={"height_ratios": [3, 1.4]})
+    h = hc.iloc[-90:].reset_index(drop=True)
+    candles(a, h)
+    for n, c in ((6, "#e377c2"), (12, "#ff9f40"), (20, "#6c5ce7")):
+        a.plot(h[f"e{n}"], color=c, lw=1.4, label=f"EMA{n}")
+    a.axhline(info["prev_high"], color="blue", ls="--", lw=1.2,
+              label=f"Broken high {info['prev_high']:.6g}")
+    a.axhline(info["price"], color="green", ls=":", lw=1.2,
+              label=f"Close {info['price']:.6g}")
+    a.axhline(info["sl"], color="red", ls="--", lw=1.2, label=f"SL {info['sl']:.6g}")
+    lo = min(float(h.l.min()), info["sl"]) * 0.98
+    hi = float(h.h.max()) * 1.04
+    a.set_ylim(lo, hi)
+    a.legend(fontsize=9, loc="upper left")
+    st = max(len(h) // 8, 1)
+    a.set_xticks(range(0, len(h), st))
+    a.set_xticklabels(h.t.dt.strftime("%d %b %H:%M")[::st], fontsize=8)
+    a.set_title(f'{info["symbol"]} 4h PUMP | +{info["body"]}% candle | '
+                f'4h vol x{info["vr4"]} | 1D vol x{info["dvr"]} vs avg', fontsize=12)
+    dd = d1.iloc[-40:].reset_index(drop=True)
+    cols = ["green" if r.c >= r.o else "red" for r in dd.itertuples()]
+    b.bar(range(len(dd)), dd.v, color=cols, width=0.7)
+    b.axhline(info["d1_avg"], color="black", ls="--", lw=1.2, label="20d avg volume")
+    b.legend(fontsize=9, loc="upper left")
+    st2 = max(len(dd) // 6, 1)
+    b.set_xticks(range(0, len(dd), st2))
+    b.set_xticklabels(dd.t.dt.strftime("%d %b")[::st2], fontsize=8)
+    b.set_title("1D volume", fontsize=11)
+    plt.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=100)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
 def tg_photo(buf, caption):
     tok = os.environ["TELEGRAM_BOT_TOKEN"]
     chat = os.environ["TELEGRAM_CHAT_ID"]
@@ -326,19 +422,21 @@ def debug(sym):
     print("==== TEST", sym, "====")
     if z is None:
         print("no weekly data / not enough bars")
-        return
-    print(f"WEEKLY  52w low {z['low52']:.6g} | drawdown {z['dd']}% (need >= {MIN_DD})")
-    print(f"WEEKLY  above low {z['above_low_pct']}% (need <= {MAX_ABOVE_LOW*100:.0f}) | 4w pump {z['pump4w_pct']}%")
-    print(f"WEEKLY  ZONE PASSED: {z['passed']} | RSI {z['rsi']} | div {z['divergence']} | wscore {z['wscore']}/40")
+    else:
+        print(f"WEEKLY  52w low {z['low52']:.6g} | drawdown {z['dd']}% (need >= {MIN_DD})")
+        print(f"WEEKLY  above low {z['above_low_pct']}% (need <= {MAX_ABOVE_LOW*100:.0f}) | 4w pump {z['pump4w_pct']}%")
+        print(f"WEEKLY  ZONE PASSED: {z['passed']} | RSI {z['rsi']} | div {z['divergence']} | wscore {z['wscore']}/40")
     st, h4, info = h4_status(sym)
     print(f"4H      status: {st}")
     print(f"4H      {info}")
-    if st == "triggered":
+    if z is not None and st == "triggered":
         total = z["wscore"] + info["s4"]
         price = float(h4.c.iloc[-1])
         tgt, rr = plan(z, price, info["swing_sl"])
         print(f"TOTAL   {total:.1f}/100 grade {grade(total)} | need >= {ALERT_MIN_SCORE}")
         print(f"PLAN    price {price:.6g} | 4h SL {info['swing_sl']:.6g} | target {tgt:.6g} | RR {rr} (need >= {MIN_RR})")
+    p = pump_check(sym)
+    print("PUMP    ", "PASSED " + str(p["info"]) if p else "no pump signal on last closed 4h candle")
 
 
 # ---------------- main ----------------
@@ -355,6 +453,37 @@ def main():
 
     syms, turn = get_symbols()
     print("pairs (liquid crypto):", len(syms))
+
+    # 0) PUMP / BIG BREAKOUT alerts
+    if PUMP_ENABLED:
+        with ThreadPoolExecutor(6) as ex:
+            pumps = [p for p in ex.map(pump_check, syms) if p]
+        pumps.sort(key=lambda p: p["info"]["body"], reverse=True)
+        print("pump signals:", len(pumps))
+        sent_n = 0
+        for p in pumps:
+            if sent_n >= PUMP_MAX_ALERTS:
+                break
+            i = p["info"]
+            key = "pump:" + i["symbol"]
+            if now - state["sent"].get(key, 0) < PUMP_RESEND_HOURS * 3600:
+                continue
+            tag = "🔥🔥 MEGA PUMP" if i["mega"] else "🚀 PUMP"
+            cap = (f"{tag} {i['symbol']}\n"
+                   f"4h candle +{i['body']}% (2 candles +{i['two']}%) broke "
+                   f"{PUMP_LOOKBACK}-candle high\n"
+                   f"4h volume x{i['vr4']} | 1D volume x{i['dvr']} vs 20d avg\n"
+                   f"Close: {i['price']:.6g}\n"
+                   f"Broken level: {i['prev_high']:.6g}\n"
+                   f"SL idea: {i['sl']:.6g}\n"
+                   f"⚠️ Big candle already ran - avoid chasing, wait for retest if possible")
+            try:
+                if tg_photo(make_pump_chart(p), cap):
+                    state["sent"][key] = now
+                    sent_n += 1
+            except Exception as e:
+                print("pump send error", i["symbol"], e)
+
     with ThreadPoolExecutor(6) as ex:
         zones = [z for z in ex.map(analyze_zone, syms) if z]
     zmap = {z["symbol"]: z for z in zones}
