@@ -25,8 +25,9 @@ MAX_3D_PUMP = 45.0
 READY_PCT = 4.0
 
 # ---- WAIT CANDLES ----
-CONFIRM_CANDLES = 2           # alert only after this many CLOSED candles follow the green trigger candle
-                              # (those candles can close anywhere - no EMA20 condition)
+CONFIRM_CANDLES = 2           # zone alert: wait this many CLOSED candles after the green trigger candle
+PUMP_CONFIRM_CANDLES = 2      # pump alert: wait this many CLOSED candles after the big pump candle
+                              # (those candles can close anywhere - no extra condition)
 
 # ---- smart filters ----
 MIN_TURNOVER = 50_000
@@ -40,8 +41,8 @@ BTC_DUMP_MIN_SCORE = 70
 
 # ---- PUMP / BIG BREAKOUT rules ----
 PUMP_ENABLED = True
-PUMP_BODY_PCT = 8.0           # last closed 4h candle body >= this %
-PUMP_2C_PCT = 12.0            # OR last 2 candles combined >= this %
+PUMP_BODY_PCT = 8.0           # trigger 4h candle body >= this %
+PUMP_2C_PCT = 12.0            # OR trigger candle + previous candle combined >= this %
 PUMP_LOOKBACK = 18            # close must break highest high of last N 4h candles (18 = 3 days)
 PUMP_VOL4H_X = 2.0            # 4h volume >= X times avg of last 20 candles
 PUMP_D1_VOL_X = 2.0           # 1D volume >= X times avg of previous 20 days
@@ -52,7 +53,7 @@ WATCHLIST_MAX = 40
 WATCH_MAX_DAYS = 21
 RESEND_HOURS = 24
 
-SKIP = {"TSLA","NVDA","AAPL","MSFT","AMZN","GOOGL","META","COIN","MSTR","HOOD",
+SKIP = {"TSLA","NVDA","NVIDIA","AAPL","MSFT","AMZN","GOOGL","META","COIN","MSTR","HOOD",
         "CRCL","SPY","QQQ","XAU","XAG","GOLD","SILVER","OIL","USOIL"}
 STEP = {"Week1": 604800, "Hour4": 14400, "Day1": 86400}
 
@@ -199,7 +200,6 @@ def h4_status(sym):
     """
     Trigger candle = the green candle that closed above EMA6/12/20.
     Alert fires only when CONFIRM_CANDLES more candles have CLOSED after it.
-    Those candles can close anywhere (no EMA20 condition).
     """
     try:
         h4 = klines(sym, "Hour4", 300)
@@ -211,7 +211,6 @@ def h4_status(sym):
         if len(hc) < 40:
             return None, None, {}
 
-        # ---- trigger candle (CONFIRM_CANDLES candles before the last closed one) ----
         ht = hc.iloc[:len(hc) - CONFIRM_CANDLES] if CONFIRM_CANDLES > 0 else hc
         t = ht.iloc[-1]
         body = float((t.c / t.o - 1) * 100)
@@ -235,7 +234,6 @@ def h4_status(sym):
         last = hc.iloc[-1]
         ext_now = float((last.c / last.e20 - 1) * 100)
 
-        # ---- "ready to cross" (unchanged, uses latest closed candle) ----
         gap = float((last.e20 / last.c - 1) * 100)
         ready = bool(not trig and last.c <= last.e20 and gap <= READY_PCT
                      and last.e6 > hc.e6.iloc[-4])
@@ -269,9 +267,12 @@ def btc_regime():
         return dict(above=True, chg2=0.0)
 
 
-# ---------------- PUMP / BIG BREAKOUT ----------------
+# ---------------- PUMP / BIG BREAKOUT (alert after N more closed candles) ----------------
 def pump_check(sym):
-    """Big green 4h candle + breakout + 4h volume spike + 1D volume vs average."""
+    """
+    Trigger candle = big green 4h candle + breakout + 4h volume spike + 1D volume vs average.
+    Alert fires only when PUMP_CONFIRM_CANDLES more candles have CLOSED after it.
+    """
     try:
         h4 = klines(sym, "Hour4", 150)
         if h4 is None or len(h4) < 40:
@@ -279,20 +280,21 @@ def pump_check(sym):
         for n in (6, 12, 20):
             h4[f"e{n}"] = ema(h4.c, n)
         hc = closed(h4, STEP["Hour4"])
-        if len(hc) < PUMP_LOOKBACK + 5:
+        ht = hc.iloc[:len(hc) - PUMP_CONFIRM_CANDLES] if PUMP_CONFIRM_CANDLES > 0 else hc
+        if len(ht) < PUMP_LOOKBACK + 5:
             return None
-        last = hc.iloc[-1]
-        body = float((last.c / last.o - 1) * 100)
-        two = float((last.c / hc.o.iloc[-2] - 1) * 100)
-        if last.c <= last.o:
+        t = ht.iloc[-1]                      # the big pump (trigger) candle
+        body = float((t.c / t.o - 1) * 100)
+        two = float((t.c / ht.o.iloc[-2] - 1) * 100)
+        if t.c <= t.o:
             return None
         if not (body >= PUMP_BODY_PCT or two >= PUMP_2C_PCT):
             return None
-        prev_high = float(hc.h.iloc[-1 - PUMP_LOOKBACK:-1].max())
-        if last.c <= prev_high:
+        prev_high = float(ht.h.iloc[-1 - PUMP_LOOKBACK:-1].max())
+        if t.c <= prev_high:
             return None
-        vol_avg = float(hc.v.iloc[-21:-1].mean())
-        vr4 = float(last.v / vol_avg) if vol_avg > 0 else 0.0
+        vol_avg = float(ht.v.iloc[-21:-1].mean())
+        vr4 = float(t.v / vol_avg) if vol_avg > 0 else 0.0
         if vr4 < PUMP_VOL4H_X:
             return None
         # daily volume check (only fetched if 4h passed)
@@ -306,11 +308,12 @@ def pump_check(sym):
         dvr = d_now / d_avg
         if dvr < PUMP_D1_VOL_X:
             return None
-        price = float(last.c)
-        info = dict(symbol=sym, price=price, body=round(body, 1), two=round(two, 1),
+        price = float(hc.c.iloc[-1])         # latest closed price (after the wait candles)
+        info = dict(symbol=sym, price=price, trig_close=float(t.c),
+                    trig_ts=int(t.ts), body=round(body, 1), two=round(two, 1),
                     vr4=round(vr4, 1), dvr=round(dvr, 1), d1_avg=d_avg,
                     prev_high=prev_high,
-                    sl=float(min(last.o, hc.l.iloc[-3:].min())) * 0.99,
+                    sl=float(min(t.o, ht.l.iloc[-3:].min())) * 0.99,
                     mega=bool(body >= 15 and dvr >= 4))
         return dict(info=info, hc=hc, d1=d1)
     except Exception:
@@ -336,7 +339,6 @@ def make_chart(z, h4, info, total, tgt):
     sl4 = float(info["swing_sl"])
     a2.axhline(price, color="green", ls=":", lw=1.2, label=f"Live {price:.6g}")
     a2.axhline(sl4, color="red", ls="--", lw=1.2, label=f"4h SL {sl4:.6g}")
-    # mark trigger candle
     idx = h.index[h.ts == info.get("trig_ts")]
     if len(idx):
         a2.axvline(idx[0], color="gray", ls="--", lw=1, label="Trigger candle")
@@ -385,8 +387,11 @@ def make_pump_chart(p):
     a.axhline(info["prev_high"], color="blue", ls="--", lw=1.2,
               label=f"Broken high {info['prev_high']:.6g}")
     a.axhline(info["price"], color="green", ls=":", lw=1.2,
-              label=f"Close {info['price']:.6g}")
+              label=f"Close now {info['price']:.6g}")
     a.axhline(info["sl"], color="red", ls="--", lw=1.2, label=f"SL {info['sl']:.6g}")
+    idx = h.index[h.ts == info.get("trig_ts")]
+    if len(idx):
+        a.axvline(idx[0], color="gray", ls="--", lw=1, label="Pump candle")
     lo = min(float(h.l.min()), info["sl"]) * 0.98
     hi = float(h.h.max()) * 1.04
     a.set_ylim(lo, hi)
@@ -395,7 +400,8 @@ def make_pump_chart(p):
     a.set_xticks(range(0, len(h), st))
     a.set_xticklabels(h.t.dt.strftime("%d %b %H:%M")[::st], fontsize=8)
     a.set_title(f'{info["symbol"]} 4h PUMP | +{info["body"]}% candle | '
-                f'4h vol x{info["vr4"]} | 1D vol x{info["dvr"]} vs avg', fontsize=12)
+                f'4h vol x{info["vr4"]} | 1D vol x{info["dvr"]} vs avg | '
+                f'alert after {PUMP_CONFIRM_CANDLES} candles closed', fontsize=11)
     dd = d1.iloc[-40:].reset_index(drop=True)
     cols = ["green" if r.c >= r.o else "red" for r in dd.itertuples()]
     b.bar(range(len(dd)), dd.v, color=cols, width=0.7)
@@ -460,7 +466,8 @@ def debug(sym):
         print(f"TOTAL   {total:.1f}/100 grade {grade(total)} | need >= {ALERT_MIN_SCORE}")
         print(f"PLAN    price {price:.6g} | 4h SL {info['swing_sl']:.6g} | target {tgt:.6g} | RR {rr} (need >= {MIN_RR})")
     p = pump_check(sym)
-    print("PUMP    ", "PASSED " + str(p["info"]) if p else "no pump signal on last closed 4h candle")
+    print("PUMP    ", ("PASSED (pump candle was %d closed candles ago) " % PUMP_CONFIRM_CANDLES) + str(p["info"])
+          if p else f"no pump signal (pump candle must be {PUMP_CONFIRM_CANDLES} closed candles ago)")
 
 
 # ---------------- main ----------------
@@ -478,7 +485,7 @@ def main():
     syms, turn = get_symbols()
     print("pairs (liquid crypto):", len(syms))
 
-    # 0) PUMP / BIG BREAKOUT alerts
+    # 0) PUMP / BIG BREAKOUT alerts (after N closed candles)
     if PUMP_ENABLED:
         with ThreadPoolExecutor(6) as ex:
             pumps = [p for p in ex.map(pump_check, syms) if p]
@@ -494,10 +501,12 @@ def main():
                 continue
             tag = "🔥🔥 MEGA PUMP" if i["mega"] else "🚀 PUMP"
             cap = (f"{tag} {i['symbol']}\n"
-                   f"4h candle +{i['body']}% (2 candles +{i['two']}%) broke "
+                   f"✅ 4h candle +{i['body']}% (2 candles +{i['two']}%) broke "
                    f"{PUMP_LOOKBACK}-candle high\n"
+                   f"✅ {PUMP_CONFIRM_CANDLES} more candles have closed since\n"
                    f"4h volume x{i['vr4']} | 1D volume x{i['dvr']} vs 20d avg\n"
-                   f"Close: {i['price']:.6g}\n"
+                   f"Pump candle close: {i['trig_close']:.6g}\n"
+                   f"Close now: {i['price']:.6g}\n"
                    f"Broken level: {i['prev_high']:.6g}\n"
                    f"SL idea: {i['sl']:.6g}\n"
                    f"⚠️ Big candle already ran - avoid chasing, wait for retest if possible")
