@@ -24,6 +24,10 @@ MAX_ABOVE_EMA20 = 12.0
 MAX_3D_PUMP = 45.0
 READY_PCT = 4.0
 
+# ---- WAIT CANDLES ----
+CONFIRM_CANDLES = 2           # alert only after this many CLOSED candles follow the green trigger candle
+                              # (those candles can close anywhere - no EMA20 condition)
+
 # ---- smart filters ----
 MIN_TURNOVER = 50_000
 ALERT_MIN_SCORE = 70          # GRADE A ONLY
@@ -190,8 +194,13 @@ def analyze_zone(sym, gate=True):
         return None
 
 
-# ---------------- 4h status ----------------
+# ---------------- 4h status (alert after N more closed candles) ----------------
 def h4_status(sym):
+    """
+    Trigger candle = the green candle that closed above EMA6/12/20.
+    Alert fires only when CONFIRM_CANDLES more candles have CLOSED after it.
+    Those candles can close anywhere (no EMA20 condition).
+    """
     try:
         h4 = klines(sym, "Hour4", 300)
         if h4 is None or len(h4) < 60:
@@ -199,35 +208,46 @@ def h4_status(sym):
         for n in (6, 12, 20):
             h4[f"e{n}"] = ema(h4.c, n)
         hc = closed(h4, STEP["Hour4"])
-        last = hc.iloc[-1]
-        body = float((last.c / last.o - 1) * 100)
-        ext = float((last.c / last.e20 - 1) * 100)
+        if len(hc) < 40:
+            return None, None, {}
+
+        # ---- trigger candle (CONFIRM_CANDLES candles before the last closed one) ----
+        ht = hc.iloc[:len(hc) - CONFIRM_CANDLES] if CONFIRM_CANDLES > 0 else hc
+        t = ht.iloc[-1]
+        body = float((t.c / t.o - 1) * 100)
+        ext_t = float((t.c / t.e20 - 1) * 100)
         since = None
         for k in range(1, CROSS_LOOKBACK + 1):
-            p = hc.iloc[-1 - k]
+            p = ht.iloc[-1 - k]
             if p.c <= p.e20:
                 since = k
                 break
-        vol_avg = float(hc.v.iloc[-21:-1].mean())
-        vr = float(last.v / vol_avg) if vol_avg > 0 else 0.0
-        stack = bool(last.e6 > last.e12 > last.e20)
-        slope = bool(last.e20 > hc.e20.iloc[-4])
-        swing_sl = float(hc.l.iloc[-12:].min()) * 0.995
-        pump3d = float((last.c / hc.l.iloc[-18:].min() - 1) * 100)
-        green_above = bool(last.c > last.o and last.c > last.e6
-                           and last.c > last.e12 and last.c > last.e20
-                           and body >= MIN_BODY_PCT)
+        vol_avg = float(ht.v.iloc[-21:-1].mean())
+        vr = float(t.v / vol_avg) if vol_avg > 0 else 0.0
+        stack = bool(t.e6 > t.e12 > t.e20)
+        slope = bool(t.e20 > ht.e20.iloc[-4])
+        pump3d = float((t.c / ht.l.iloc[-18:].min() - 1) * 100)
+        green_above = bool(t.c > t.o and t.c > t.e6 and t.c > t.e12
+                           and t.c > t.e20 and body >= MIN_BODY_PCT)
         trig = bool(green_above and since is not None
-                    and ext <= MAX_ABOVE_EMA20 and pump3d <= MAX_3D_PUMP)
+                    and ext_t <= MAX_ABOVE_EMA20 and pump3d <= MAX_3D_PUMP)
+
+        last = hc.iloc[-1]
+        ext_now = float((last.c / last.e20 - 1) * 100)
+
+        # ---- "ready to cross" (unchanged, uses latest closed candle) ----
         gap = float((last.e20 / last.c - 1) * 100)
         ready = bool(not trig and last.c <= last.e20 and gap <= READY_PCT
                      and last.e6 > hc.e6.iloc[-4])
+
+        swing_sl = float(hc.l.iloc[-12:].min()) * 0.995
         status = "triggered" if trig else ("ready" if ready else None)
-        s4 = trigger_score(since, vr, body, stack, slope, ext) if trig else 0.0
-        info = dict(body=round(body, 2), gap=round(gap, 2), ext=round(ext, 2),
+        s4 = trigger_score(since, vr, body, stack, slope, ext_t) if trig else 0.0
+        info = dict(body=round(body, 2), gap=round(gap, 2), ext=round(ext_now, 2),
                     since=since, vr=round(vr, 2), stack=stack, slope=slope,
                     swing_sl=swing_sl, pump3d=round(pump3d, 1),
-                    green_above=green_above, s4=round(s4, 1))
+                    green_above=green_above, s4=round(s4, 1),
+                    trig_ok=trig, trig_ts=int(t.ts))
         return status, h4, info
     except Exception:
         return None, None, {}
@@ -316,6 +336,10 @@ def make_chart(z, h4, info, total, tgt):
     sl4 = float(info["swing_sl"])
     a2.axhline(price, color="green", ls=":", lw=1.2, label=f"Live {price:.6g}")
     a2.axhline(sl4, color="red", ls="--", lw=1.2, label=f"4h SL {sl4:.6g}")
+    # mark trigger candle
+    idx = h.index[h.ts == info.get("trig_ts")]
+    if len(idx):
+        a2.axvline(idx[0], color="gray", ls="--", lw=1, label="Trigger candle")
     lo = min(float(h.l.min()), sl4) * 0.98
     hi = float(max(h.h.max(), h.e20.max())) * 1.04
     if tgt <= hi * 1.5:
@@ -327,7 +351,7 @@ def make_chart(z, h4, info, total, tgt):
     a2.set_xticks(range(0, len(h), st))
     a2.set_xticklabels(h.t.dt.strftime("%d %b %H:%M")[::st], fontsize=8)
     a2.set_title(f'{z["symbol"]} 4h | Grade {grade(total)} ({total:.0f}/100) | '
-                 f'crossed {info["since"]} candles ago | vol x{info["vr"]} | '
+                 f'alert after {CONFIRM_CANDLES} candles closed | vol x{info["vr"]} | '
                  f'next target {tgt:.6g}', fontsize=12)
     # ---------- weekly (bottom) ----------
     df = z["wk"].iloc[-130:].reset_index(drop=True)
@@ -427,7 +451,7 @@ def debug(sym):
         print(f"WEEKLY  above low {z['above_low_pct']}% (need <= {MAX_ABOVE_LOW*100:.0f}) | 4w pump {z['pump4w_pct']}%")
         print(f"WEEKLY  ZONE PASSED: {z['passed']} | RSI {z['rsi']} | div {z['divergence']} | wscore {z['wscore']}/40")
     st, h4, info = h4_status(sym)
-    print(f"4H      status: {st}")
+    print(f"4H      status: {st}  (trigger candle was {CONFIRM_CANDLES} closed candles ago)")
     print(f"4H      {info}")
     if z is not None and st == "triggered":
         total = z["wscore"] + info["s4"]
@@ -538,8 +562,9 @@ def main():
         else:
             btc_txt = "BTC 4h below EMA20 ⚠️"
         cap = (f"🚀 {sym} | Grade {grade(total)} ({total:.0f}/100)\n"
-               f"4h closed green above EMA20 (crossed {info['since']} candles ago, "
-               f"vol x{info['vr']}, {info['ext']}% above EMA20)\n"
+               f"✅ Green 4h candle closed above EMA20 {CONFIRM_CANDLES} candles ago "
+               f"(crossed {info['since']} candles before it, vol x{info['vr']})\n"
+               f"✅ {CONFIRM_CANDLES} more candles have closed since\n"
                f"Live: {price:.6g}\n"
                f"4h SL: {info['swing_sl']:.6g} | Weekly SL: {z['sl']:.6g}\n"
                f"Next target: {tgt:.6g} | R:R {rr}\n"
