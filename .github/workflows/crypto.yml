@@ -2,8 +2,8 @@ name: Crypto Scanner
 
 on:
   schedule:
-    # after each 4h candle close (UTC): 00:02, 04:02, 08:02, 12:02, 16:02, 20:02
-    - cron: '2 0,4,8,12,16,20 * * *'
+    # after each 4h candle close (UTC), at an off-peak minute to avoid GitHub delays/skips
+    - cron: '17 0,4,8,12,16,20 * * *'
   workflow_dispatch:
 
 permissions:
