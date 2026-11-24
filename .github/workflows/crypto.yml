@@ -2,8 +2,8 @@ name: Crypto Scanner
 
 on:
   schedule:
-    # after each 4h candle close (UTC), at an off-peak minute to avoid GitHub delays/skips
-    - cron: '17 0,4,8,12,16,20 * * *'
+    # start ~5 min BEFORE each 4h candle close (UTC): 03:55, 07:55, 11:55, 15:55, 19:55, 23:55
+    - cron: '55 3,7,11,15,19,23 * * *'
   workflow_dispatch:
 
 permissions:
@@ -28,6 +28,18 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      - name: Wait for 4h candle close
+        run: |
+          now=$(date -u +%s)
+          next=$(( (now / 14400 + 1) * 14400 ))
+          wait=$(( next - now ))
+          echo "Seconds to next 4h close: $wait"
+          # only wait if the close is within 10 minutes; otherwise run immediately
+          if [ "$wait" -le 600 ]; then
+            echo "Sleeping $((wait + 10))s until candle closes (+10s buffer)"
+            sleep $((wait + 10))
+          fi
 
       - name: Run scanner
         env:
