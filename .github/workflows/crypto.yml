@@ -1,14 +1,10 @@
 name: Crypto Scanner
 
 on:
-  schedule:
-    # start ~5 min BEFORE each 4h candle close (UTC): 03:55, 07:55, 11:55, 15:55, 19:55, 23:55
-    - cron: '55 3,7,11,15,19,23 * * *'
   workflow_dispatch:
 
 permissions:
-  contents: read
-  actions: write
+  contents: write
 
 concurrency:
   group: crypto-scanner
@@ -35,7 +31,6 @@ jobs:
           next=$(( (now / 14400 + 1) * 14400 ))
           wait=$(( next - now ))
           echo "Seconds to next 4h close: $wait"
-          # only wait if the close is within 10 minutes; otherwise run immediately
           if [ "$wait" -le 600 ]; then
             echo "Sleeping $((wait + 10))s until candle closes (+10s buffer)"
             sleep $((wait + 10))
@@ -49,8 +44,15 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python scanner.py
 
-      - name: Keep schedule alive
-        if: ${{ github.event_name == 'schedule' }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh workflow enable "Crypto Scanner" --repo "$GITHUB_REPOSITORY" || true
+      - name: Save state
+        run: |
+          if [ -n "$(git status --porcelain state.json)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add state.json
+            git commit -m "update state [skip ci]"
+            git pull --rebase origin main
+            git push
+          else
+            echo "state.json unchanged"
+          fi
